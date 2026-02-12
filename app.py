@@ -1,11 +1,9 @@
 from flask import Flask, request, jsonify
 import os
+import json
 from dotenv import load_dotenv
-
-# ✅ UPDATED Gemini import (new SDK style)
 from google import genai
-
-import spacy
+from google.genai import types
 
 # -----------------------------
 # ENV & GEMINI CONFIG
@@ -16,70 +14,6 @@ client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY")
 )
 
-# -----------------------------
-# SPACY (LAZY LOAD – VERY IMPORTANT)
-# -----------------------------
-nlp = None
-
-def get_nlp():
-    global nlp
-    if nlp is None:
-        try:
-            nlp = spacy.load("en_core_web_md")
-        except Exception:
-            # fallback so service never crashes
-            nlp = spacy.blank("en")
-    return nlp
-
-# -----------------------------
-# TARGET KEYWORDS
-# -----------------------------
-TARGET_KEYWORDS = {
-    "saas": ["software", "platform", "cloud", "subscription"],
-    "ai": ["ai", "automation", "nlp", "model", "learning"],
-    "cloud": ["cloud", "aws", "azure", "infrastructure"]
-}
-
-# -----------------------------
-# NLP KEYWORD EXTRACTION
-# -----------------------------
-def extract_keywords(text: str):
-    doc = get_nlp()(text.lower())
-    keywords = set()
-
-    for token in doc:
-        if token.pos_ in ["NOUN", "PROPN"] and not token.is_stop:
-            lemma = token.lemma_.replace("-", " ").strip()
-            if lemma:
-                keywords.add(lemma)
-
-    return keywords
-
-# -----------------------------
-# GEMINI EMAIL GENERATOR
-# -----------------------------
-def generate_email_with_gemini(company, industry, keywords):
-    prompt = f"""
-You are a B2B sales assistant.
-
-Write a short, professional cold email for a company named {company}
-operating in the {industry} space.
-
-Mention these keywords naturally: {", ".join(keywords)}.
-Tone: professional, friendly, non-pushy.
-Length: 80-120 words.
-"""
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
-        contents=prompt
-    )
-
-    return response.text.strip() if response and response.text else None
-
-# -----------------------------
-# FLASK APP
-# -----------------------------
 app = Flask(__name__)
 
 # -----------------------------
@@ -89,9 +23,105 @@ app = Flask(__name__)
 def health():
     return jsonify({"status": "AI service running"})
 
+
 # -----------------------------
-# EMAIL GENERATION API
+# AI LEAD SCORING 
 # -----------------------------
+def score_lead_with_ai(industry, requirement):
+    prompt = f"""
+You are a B2B lead scoring AI.
+
+Business Target Requirement:
+{requirement}
+
+Lead Industry:
+{industry}
+
+Score this lead from 0 to 100 based on relevance.
+
+Return ONLY JSON in this format:
+{{
+  "lead_score": 75,
+  "reason": "Short explanation"
+}}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+
+        if not response or not response.text:
+            raise ValueError("Empty AI response")
+
+        parsed = json.loads(response.text)
+
+        return {
+            "lead_score": int(parsed.get("lead_score", 0)),
+            "reason": parsed.get("reason", "")
+        }
+
+    except Exception as e:
+        print("AI SCORING ERROR:", e)
+        return {
+            "lead_score": 0,
+            "reason": "AI service failed"
+        }
+
+
+@app.route("/score", methods=["POST"])
+def score_lead():
+    data = request.json or {}
+
+    industry = data.get("industry", "")
+    requirement = data.get("requirement", "")
+
+    if not industry and not requirement:
+        return jsonify({
+            "lead_score": 0,
+            "reason": "Insufficient data"
+        })
+
+    result = score_lead_with_ai(industry, requirement)
+
+    return jsonify(result)
+
+
+# -----------------------------
+# EMAIL GENERATION
+# -----------------------------
+def generate_email_with_gemini(company, industry, requirement):
+    prompt = f"""
+Write a short B2B cold email.
+
+Company: {company}
+Industry: {industry}
+Requirement: {requirement}
+
+Tone: Professional, friendly, non-pushy.
+Length: 40-60 words.
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
+
+        if not response or not response.text:
+            return None
+
+        return response.text.strip()
+
+    except Exception as e:
+        print("EMAIL GENERATION ERROR:", e)
+        return None
+
+
 @app.route("/generate-email", methods=["POST"])
 def generate_email_api():
     data = request.json or {}
@@ -99,51 +129,20 @@ def generate_email_api():
     email_text = generate_email_with_gemini(
         company=data.get("company_name", ""),
         industry=data.get("industry", ""),
-        keywords=data.get("keywords", [])
+        requirement=data.get("requirement", "")
     )
 
     if not email_text:
         return jsonify({
-            "error": "LLM quota exceeded or service unavailable"
+            "error": "AI service unavailable"
         }), 503
 
     return jsonify({"email": email_text})
 
-# -----------------------------
-# LEAD SCORING API
-# -----------------------------
-@app.route("/score", methods=["POST"])
-def score_lead():
-    data = request.json or {}
-
-    industry = data.get("industry", "").lower()
-    website_text = data.get("website_text", "")
-
-    combined_text = f"{industry} {website_text}"
-    extracted_keywords = extract_keywords(combined_text)
-
-    print("Combined text:", combined_text)
-    print("Extracted keywords:", extracted_keywords)
-
-    score = 20  # base score
-    reasons = []
-
-    for domain, keywords in TARGET_KEYWORDS.items():
-        match_count = len(extracted_keywords.intersection(set(keywords)))
-        if match_count > 0:
-            score += match_count * 15
-            reasons.append(f"{domain} keyword match ({match_count})")
-
-    score = min(score, 100)
-
-    return jsonify({
-        "lead_score": score,
-        "keywords_found": list(extracted_keywords),
-        "reason": ", ".join(reasons) or "Low relevance"
-    })
 
 # -----------------------------
 # LOCAL RUN
 # -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port)
